@@ -29,7 +29,6 @@ class TeeSlot(BaseModel):
     source: Literal["uia", "screenshot", "manual"] = "uia"
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
-0000
 class TeeSheetResponse(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 

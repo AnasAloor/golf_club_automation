@@ -355,19 +355,28 @@ class ClubCaddieAutomation:
 
     def _extract_tee_sheet(self, target_date: date) -> TeeSheetResponse:
         tee_window = self._current_tee_sheet_window()
-        texts = self._extract_visible_text_items(tee_window)
-        side_split_x = self._window_midpoint_x(tee_window)
-        front = self._extract_slots_for_side(texts, "front", side_split_x)
-        back = self._extract_slots_for_side(texts, "back", side_split_x)
+        front: list[TeeSlot] = []
+        back: list[TeeSlot] = []
         warnings = []
         used_ocr = False
 
+        try:
+            front, back = self._extract_slots_from_screenshot(tee_window)
+            used_ocr = bool(front or back)
+        except Exception as exc:
+            warnings.append(f"Screenshot/OCR fallback failed: {exc}")
+
         if not front and not back:
-            try:
-                front, back = self._extract_slots_from_screenshot(tee_window)
-                used_ocr = True
-            except Exception as exc:
-                warnings.append(f"Screenshot/OCR fallback failed: {exc}")
+            texts = self._extract_visible_text_items(tee_window)
+            side_split_x = self._window_midpoint_x(tee_window)
+            front = self._extract_slots_for_side(texts, "front", side_split_x)
+            back = self._extract_slots_for_side(texts, "back", side_split_x)
+
+        front, back, inferred_count = self._balance_side_slots(front, back)
+        if inferred_count:
+            warnings.append(
+                f"{inferred_count} slot(s) were inferred from the opposite side because OCR missed a side-specific row."
+            )
 
         if used_ocr and (front or back):
             warnings.append("Tee sheet grid text was extracted with screenshot/OCR fallback.")
@@ -383,9 +392,80 @@ class ClubCaddieAutomation:
             warnings=warnings,
         )
 
+    def _balance_side_slots(
+        self,
+        front: list[TeeSlot],
+        back: list[TeeSlot],
+    ) -> tuple[list[TeeSlot], list[TeeSlot], int]:
+        front_by_time = {slot.time: slot for slot in front}
+        back_by_time = {slot.time: slot for slot in back}
+        all_times = sorted(
+            set(front_by_time) | set(back_by_time),
+            key=self._time_sort_key,
+        )
+        inferred_count = 0
+
+        for time_label in all_times:
+            if time_label not in front_by_time:
+                front_by_time[time_label] = self._inferred_slot(time_label, "front")
+                inferred_count += 1
+            if time_label not in back_by_time:
+                back_by_time[time_label] = self._inferred_slot(time_label, "back")
+                inferred_count += 1
+
+        return (
+            self._sort_slots(front_by_time.values()),
+            self._sort_slots(back_by_time.values()),
+            inferred_count,
+        )
+
+    def _inferred_slot(self, time_label: str, side: str) -> TeeSlot:
+        return TeeSlot(
+            time=time_label,
+            side=side,
+            status=SlotStatus.UNKNOWN,
+            raw_text="Time label inferred from opposite Tee Sheet side; side-specific OCR text was not found.",
+            player_or_note=None,
+            source="screenshot",
+            confidence=0.2,
+        )
+
     def _extract_slots_from_screenshot(self, tee_window: object) -> tuple[list[TeeSlot], list[TeeSlot]]:
         self._focus_window(tee_window)
-        time.sleep(0.5)
+        self._reset_tee_sheet_scroll(tee_window)
+        front: dict[str, TeeSlot] = {}
+        back: dict[str, TeeSlot] = {}
+        seen_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        repeated_pages = 0
+
+        for _ in range(90):
+            visible_front, visible_back = self._extract_visible_screenshot_slots(tee_window)
+            signature = (
+                tuple(slot.time for slot in visible_front),
+                tuple(slot.time for slot in visible_back),
+            )
+
+            new_slots = self._merge_slots(front, visible_front)
+            new_slots += self._merge_slots(back, visible_back)
+
+            if signature in seen_signatures or new_slots == 0:
+                repeated_pages += 1
+            else:
+                repeated_pages = 0
+                seen_signatures.add(signature)
+
+            if repeated_pages >= 5:
+                break
+
+            self._scroll_tee_sheet_down(tee_window)
+
+        return self._sort_slots(front.values()), self._sort_slots(back.values())
+
+    def _extract_visible_screenshot_slots(
+        self,
+        tee_window: object,
+    ) -> tuple[list[TeeSlot], list[TeeSlot]]:
+        time.sleep(0.35)
         image = tee_window.capture_as_image()
         width, height = image.size
         grid_top = int(height * 0.24)
@@ -393,17 +473,59 @@ class ClubCaddieAutomation:
         midpoint = width // 2
 
         full_grid_image = image.crop((0, int(height * 0.20), width, grid_bottom))
-        front, back = self._ocr_slots_from_full_grid(full_grid_image)
-        if front or back:
-            return front, back
-
+        full_front, full_back = self._ocr_slots_from_full_grid(full_grid_image)
         front_image = image.crop((0, grid_top, midpoint, grid_bottom))
         back_image = image.crop((midpoint, grid_top, width, grid_bottom))
+        front = {slot.time: slot for slot in full_front}
+        back = {slot.time: slot for slot in full_back}
 
-        return (
-            self._ocr_slots_for_region(front_image, "front"),
-            self._ocr_slots_for_region(back_image, "back"),
-        )
+        self._merge_slots(front, self._ocr_slots_for_region(front_image, "front"))
+        self._merge_slots(back, self._ocr_slots_for_region(back_image, "back"))
+
+        return self._sort_slots(front.values()), self._sort_slots(back.values())
+
+    def _merge_slots(self, target: dict[str, TeeSlot], slots: Iterable[TeeSlot]) -> int:
+        new_slots = 0
+        for slot in slots:
+            existing = target.get(slot.time)
+            if existing is None or self._slot_quality(slot) > self._slot_quality(existing):
+                if existing is None:
+                    new_slots += 1
+                target[slot.time] = slot
+        return new_slots
+
+    def _slot_quality(self, slot: TeeSlot) -> tuple[int, float]:
+        has_note = 1 if slot.player_or_note else 0
+        is_booked = 1 if slot.status in {SlotStatus.BOOKED, SlotStatus.BLOCKED} else 0
+        return has_note + is_booked, slot.confidence
+
+    def _sort_slots(self, slots: Iterable[TeeSlot]) -> list[TeeSlot]:
+        return sorted(slots, key=lambda slot: self._time_sort_key(slot.time))
+
+    def _time_sort_key(self, time_label: str) -> tuple[int, int]:
+        parsed = datetime.strptime(time_label, "%I:%M %p")
+        return parsed.hour, parsed.minute
+
+    def _reset_tee_sheet_scroll(self, tee_window: object) -> None:
+        for _ in range(8):
+            self._scroll_tee_sheet(tee_window, wheel_dist=8)
+            time.sleep(0.05)
+        time.sleep(0.5)
+
+    def _scroll_tee_sheet_down(self, tee_window: object) -> None:
+        self._scroll_tee_sheet(tee_window, wheel_dist=-1)
+        time.sleep(0.5)
+
+    def _scroll_tee_sheet(self, tee_window: object, wheel_dist: int) -> None:
+        rectangle = self._safe_rectangle(tee_window)
+        if rectangle is None:
+            raise ClubCaddieAutomationError("Tee Sheet window position was not available.")
+
+        y = int(rectangle.top + (rectangle.bottom - rectangle.top) * 0.68)
+        front_x = int(rectangle.left + (rectangle.right - rectangle.left) * 0.25)
+        back_x = int(rectangle.left + (rectangle.right - rectangle.left) * 0.75)
+        mouse.scroll(coords=(front_x, y), wheel_dist=wheel_dist)
+        mouse.scroll(coords=(back_x, y), wheel_dist=wheel_dist)
 
     def _ocr_slots_from_full_grid(self, image: object) -> tuple[list[TeeSlot], list[TeeSlot]]:
         scaled = image.convert("L").resize((image.size[0] * 2, image.size[1] * 2))

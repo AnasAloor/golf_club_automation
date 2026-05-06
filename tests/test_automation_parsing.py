@@ -1,5 +1,5 @@
 from app.automation.club_caddie import ClubCaddieAutomation
-from app.schemas import SlotStatus
+from app.schemas import SlotStatus, TeeSlot
 
 
 class FakeControl:
@@ -81,6 +81,26 @@ def test_hidden_controls_are_not_used_for_detection_or_clicks() -> None:
     assert "LOGIN" not in automation._control_texts(window)
     assert automation._click_first_match(window, [r"^LOGIN$"]) is False
     assert hidden_login.clicked is False
+
+
+def test_balances_missing_side_slots_as_unknown() -> None:
+    automation = automation_without_desktop()
+
+    front, back, inferred_count = automation._balance_side_slots(
+        front=[
+            TeeSlot(
+                time="8:36 AM",
+                side="front",
+                status=SlotStatus.AVAILABLE,
+                raw_text="8:36 AM | Add",
+            )
+        ],
+        back=[],
+    )
+
+    assert inferred_count == 1
+    assert front[0].time == back[0].time == "8:36 AM"
+    assert back[0].status == SlotStatus.UNKNOWN
 
 
 def test_normalizes_time_labels() -> None:

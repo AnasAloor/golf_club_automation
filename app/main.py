@@ -1,9 +1,16 @@
 from fastapi import Depends, FastAPI, HTTPException, status
 
 from app.automation.club_caddie import ClubCaddieAutomationError
-from app.schemas import HealthResponse, TeeSheetQuery, TeeSheetResponse
+from app.schemas import (
+    HealthResponse,
+    TeeSheetBookingRequest,
+    TeeSheetBookingResponse,
+    TeeSheetQuery,
+    TeeSheetResponse,
+)
 from app.services.tee_sheet import (
     TeeSheetAutomation,
+    book_tee_time,
     build_automation,
     fetch_tee_sheet_for_date,
 )
@@ -31,6 +38,20 @@ async def query_tee_sheet(
 ) -> TeeSheetResponse:
     try:
         return await fetch_tee_sheet_for_date(payload.date, automation)
+    except ClubCaddieAutomationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+
+@app.post("/tee-sheet/book", response_model=TeeSheetBookingResponse)
+async def book_tee_sheet(
+    payload: TeeSheetBookingRequest,
+    automation: TeeSheetAutomation = Depends(get_automation),
+) -> TeeSheetBookingResponse:
+    try:
+        return await book_tee_time(payload, automation)
     except ClubCaddieAutomationError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

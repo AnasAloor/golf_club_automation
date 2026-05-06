@@ -10,7 +10,14 @@ from pywinauto.application import Application
 from pywinauto.findwindows import ElementAmbiguousError, ElementNotFoundError
 
 from app.config import Settings
-from app.schemas import SlotStatus, TeeSheetResponse, TeeSlot
+from app.schemas import (
+    BookingStatus,
+    TeeSheetBookingRequest,
+    TeeSheetBookingResponse,
+    SlotStatus,
+    TeeSheetResponse,
+    TeeSlot,
+)
 
 
 class ClubCaddieAutomationError(RuntimeError):
@@ -42,6 +49,39 @@ class ClubCaddieAutomation:
         except Exception as exc:
             raise ClubCaddieAutomationError(f"Club Caddie automation failed: {exc}") from exc
 
+    def book_tee_time(self, booking: TeeSheetBookingRequest) -> TeeSheetBookingResponse:
+        try:
+            self._run_step("attach or launch Club Caddie", self._attach_or_launch)
+            self._run_step("close update dialog", self._close_update_dialog_if_present)
+            self._run_step("close existing booking modal", self._close_booking_modal_if_present)
+            self._run_step("login if needed", self._login_if_needed)
+            self._run_step("close post-login update dialog", self._close_update_dialog_if_present)
+            self._run_step("open Check-in", self._open_checkin)
+            self._run_step("open Tee Sheet", self._open_tee_sheet)
+            self._run_step("select tee sheet date", self._select_date, booking.date)
+            self._run_step("click booking add button", self._click_slot_add_button, booking)
+            self._run_step("fill booking modal", self._fill_booking_modal, booking)
+
+            if booking.dry_run:
+                return self._booking_response(
+                    booking,
+                    BookingStatus.UNKNOWN,
+                    "Booking form filled successfully; dry_run skipped Reserve.",
+                    ["dry_run was enabled, so Reserve was not clicked."],
+                )
+
+            self._run_step("submit reservation", self._submit_booking_modal, booking)
+            return self._booking_response(
+                booking,
+                BookingStatus.RESERVED,
+                "Reservation submitted successfully.",
+                [],
+            )
+        except ClubCaddieAutomationError:
+            raise
+        except Exception as exc:
+            raise ClubCaddieAutomationError(f"Club Caddie booking automation failed: {exc}") from exc
+
     def _run_step(self, step_name: str, action: Callable[..., object], *args: object) -> object:
         try:
             return action(*args)
@@ -56,7 +96,7 @@ class ClubCaddieAutomation:
 
         try:
             self.app = Application(backend="uia").connect(path=str(executable))
-        except (ElementNotFoundError, ProcessLookupError, RuntimeError):
+        except Exception:
             self.app = Application(backend="uia").start(str(executable))
 
         self._wait_for_app_window(timeout_seconds=self.settings.window_wait_seconds)
@@ -159,13 +199,16 @@ class ClubCaddieAutomation:
             return
 
         home_window = self._find_window(
-            [r".*Rolling.*", r".*Club.*", r".*Caddie.*"],
-            timeout_seconds=self.settings.window_wait_seconds,
+            [r".*Tee.*", r".*Rolling.*", r".*Club.*", r".*Caddie.*"],
+            timeout_seconds=5,
         )
+        if home_window is None:
+            app_windows = self._visible_windows(app_only=True)
+            home_window = app_windows[0] if app_windows else None
         if home_window is None:
             raise ClubCaddieAutomationError("Home window was not found after login.")
 
-        if self._window_contains_text(home_window, ["TEE SHEET", "REGISTER"]):
+        if self._window_contains_any_text(home_window, ["TEE SHEET", "REGISTER"]):
             return
 
         self._focus_window(home_window)
@@ -389,6 +432,418 @@ class ClubCaddieAutomation:
             front=front,
             back=back,
             extracted_at=datetime.now(UTC),
+            warnings=warnings,
+        )
+
+    def _click_slot_add_button(self, booking: TeeSheetBookingRequest) -> None:
+        target_time = self._normalize_time(booking.time)
+        tee_window = self._current_tee_sheet_window()
+        self._focus_window(tee_window)
+        self._reset_tee_sheet_scroll(tee_window)
+        seen_signatures: set[tuple[str, str]] = set()
+        repeated_pages = 0
+
+        for _ in range(90):
+            image = tee_window.capture_as_image()
+            click_coords = self._find_add_button_coords_by_geometry(image, booking.side, target_time)
+            if click_coords is None:
+                click_coords = self._find_add_button_coords(image, booking.side, target_time)
+            if click_coords is not None:
+                mouse.click(button="left", coords=click_coords)
+                self._wait_for_any_booking_modal()
+                return
+
+            front, back = self._ocr_slots_from_full_grid(
+                image.crop((0, int(image.size[1] * 0.20), image.size[0], int(image.size[1] * 0.97)))
+            )
+            signature = (
+                ",".join(slot.time for slot in front),
+                ",".join(slot.time for slot in back),
+            )
+            if signature in seen_signatures:
+                repeated_pages += 1
+            else:
+                seen_signatures.add(signature)
+                repeated_pages = 0
+            if repeated_pages >= 5:
+                break
+
+            self._scroll_tee_sheet_down(tee_window)
+
+        fallback_coords = self._find_any_visible_available_slot_coords(tee_window, booking.side)
+        if fallback_coords is not None:
+            mouse.double_click(button="left", coords=fallback_coords)
+            self._wait_for_any_booking_modal()
+            return
+
+        raise ClubCaddieAutomationError(
+            f"Available Add button was not found for {booking.side} {target_time}."
+        )
+
+    def _find_any_visible_available_slot_coords(
+        self,
+        tee_window: object,
+        side: str,
+    ) -> tuple[int, int] | None:
+        self._reset_tee_sheet_scroll(tee_window)
+        rectangle = self._safe_rectangle(tee_window)
+        if rectangle is None:
+            return None
+
+        side_left = rectangle.left if side == "front" else (rectangle.left + rectangle.right) // 2
+        side_width = (rectangle.right - rectangle.left) // 2
+        x = int(side_left + side_width * 0.25)
+        first_slot_y = int(rectangle.top + (rectangle.bottom - rectangle.top) * 0.36)
+        return x, first_slot_y
+
+    def _find_add_button_coords_by_geometry(
+        self,
+        image: object,
+        side: str,
+        target_time: str,
+    ) -> tuple[int, int] | None:
+        width, height = image.size
+        side_left = 0 if side == "front" else width // 2
+        side_width = width // 2
+        side_image = image.crop((side_left, 0, side_left + side_width, height))
+        scaled = side_image.convert("L").resize((side_image.size[0] * 2, side_image.size[1] * 2))
+        ocr_data = pytesseract.image_to_data(scaled, output_type=pytesseract.Output.DICT, config="--psm 11")
+        time_words = []
+
+        for index, text in enumerate(ocr_data["text"]):
+            word_text = str(text).strip()
+            if self._normalize_time_or_none(word_text) != target_time:
+                continue
+
+            left = int(ocr_data["left"][index]) / 2 + side_left
+            top = int(ocr_data["top"][index]) / 2
+            word_height = int(ocr_data["height"][index]) / 2
+            time_words.append((left, top + word_height / 2))
+
+        if not time_words:
+            return None
+
+        time_left, row_center_y = sorted(time_words, key=lambda item: item[0])[0]
+        add_x = time_left + 45
+        return int(add_x), int(row_center_y)
+
+    def _find_add_button_coords(
+        self,
+        image: object,
+        side: str,
+        target_time: str,
+    ) -> tuple[int, int] | None:
+        width, height = image.size
+        crop_top = int(height * 0.20)
+        crop_bottom = int(height * 0.97)
+        side_left = 0 if side == "front" else width // 2
+        side_right = width // 2 if side == "front" else width
+        side_image = image.crop((side_left, crop_top, side_right, crop_bottom))
+        scaled = side_image.convert("L").resize((side_image.size[0] * 2, side_image.size[1] * 2))
+        ocr_data = pytesseract.image_to_data(scaled, output_type=pytesseract.Output.DICT, config="--psm 6")
+        time_rows = self._ocr_word_rows(ocr_data, scale=2, x_offset=side_left, y_offset=crop_top)
+
+        for row in time_rows:
+            row_text = " ".join(word["text"] for word in row)
+            if self._normalize_time_or_none(row_text) != target_time:
+                continue
+            if "add" not in row_text.lower():
+                raise ClubCaddieAutomationError(f"Slot {side} {target_time} does not appear available.")
+
+            add_words = [word for word in row if word["text"].lower() == "add"]
+            add_word = add_words[0] if add_words else row[-1]
+            return int(add_word["center_x"]), int(add_word["center_y"])
+
+        return None
+
+    def _ocr_word_rows(
+        self,
+        ocr_data: dict[str, list[object]],
+        scale: int,
+        x_offset: int,
+        y_offset: int,
+    ) -> list[list[dict[str, object]]]:
+        rows: dict[tuple[int, int, int], list[dict[str, object]]] = {}
+        for index, text in enumerate(ocr_data["text"]):
+            word_text = str(text).strip()
+            if not word_text:
+                continue
+
+            key = (
+                int(ocr_data["block_num"][index]),
+                int(ocr_data["par_num"][index]),
+                int(ocr_data["line_num"][index]),
+            )
+            left = int(ocr_data["left"][index]) / scale + x_offset
+            top = int(ocr_data["top"][index]) / scale + y_offset
+            width = int(ocr_data["width"][index]) / scale
+            height = int(ocr_data["height"][index]) / scale
+            rows.setdefault(key, []).append(
+                {
+                    "text": word_text,
+                    "center_x": left + width / 2,
+                    "center_y": top + height / 2,
+                }
+            )
+
+        return [sorted(words, key=lambda word: float(word["center_x"])) for words in rows.values()]
+
+    def _normalize_time_or_none(self, text: str) -> str | None:
+        match = self.TIME_PATTERN.search(text)
+        if match is None:
+            return None
+        return self._normalize_time(match.group(0))
+
+    def _wait_for_booking_modal(self, target_time: str) -> object:
+        deadline = time.monotonic() + self.settings.window_wait_seconds
+        while time.monotonic() < deadline:
+            for window in self._visible_windows(app_only=True):
+                texts = self._control_texts(window)
+                combined = "\n".join(texts).upper()
+                if target_time.upper() in combined and "RESERVE" in combined and "SELECT PLAYERS" in combined:
+                    return window
+            time.sleep(0.5)
+        raise ClubCaddieAutomationError("Booking modal did not open.")
+
+    def _wait_for_any_booking_modal(self) -> object:
+        deadline = time.monotonic() + self.settings.window_wait_seconds
+        while time.monotonic() < deadline:
+            try:
+                return self._current_booking_modal()
+            except ClubCaddieAutomationError:
+                time.sleep(0.5)
+        raise ClubCaddieAutomationError("Booking modal did not open.")
+
+    def _fill_booking_modal(self, booking: TeeSheetBookingRequest) -> None:
+        modal = self._current_booking_modal()
+        self._focus_window(modal)
+        self._set_booking_when_and_where(modal, booking)
+        self._select_booking_option(modal, "Select Holes", str(booking.holes))
+        self._select_booking_option(modal, "Select Players", str(len(booking.players)))
+        self._fill_booking_player_rows(modal, booking)
+
+    def _set_booking_when_and_where(self, modal: object, booking: TeeSheetBookingRequest) -> None:
+        target_time = self._normalize_time(booking.time)
+        when_edit = self._control_near_label(modal, "When", "Edit")
+        if when_edit is None:
+            raise ClubCaddieAutomationError("Booking modal When field was not found.")
+        self._replace_edit_text(when_edit, target_time)
+
+        where_value = "Front" if booking.side == "front" else "Back"
+        where_combo = self._control_near_label(modal, "Where", "ComboBox")
+        if where_combo is None:
+            raise ClubCaddieAutomationError("Booking modal Where field was not found.")
+        self._select_combo_value(where_combo, where_value)
+
+        self._verify_booking_when_and_where(modal, target_time, where_value)
+
+    def _replace_edit_text(self, edit_control: object, value: str) -> None:
+        try:
+            edit_control.click_input()
+            edit_control.type_keys("^a{BACKSPACE}" + value, with_spaces=True, set_foreground=True)
+        except Exception:
+            self._set_edit_text(edit_control, value)
+
+    def _select_combo_value(self, combo_box: object, value: str) -> None:
+        try:
+            combo_box.select(value)
+            return
+        except Exception:
+            pass
+
+        try:
+            combo_box.click_input()
+            combo_box.type_keys("^a{BACKSPACE}" + value + "{ENTER}", with_spaces=True, set_foreground=True)
+        except Exception:
+            self._set_edit_text(combo_box, value)
+
+    def _verify_booking_when_and_where(self, modal: object, target_time: str, where_value: str) -> None:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            when_edit = self._control_near_label(modal, "When", "Edit")
+            where_combo = self._control_near_label(modal, "Where", "ComboBox")
+            when_text = self._text_of(when_edit) if when_edit is not None else ""
+            where_text = self._combo_text(where_combo) if where_combo is not None else ""
+            if self._normalize_time_or_none(when_text) == target_time and where_value.lower() in where_text.lower():
+                return
+            time.sleep(0.2)
+
+        raise ClubCaddieAutomationError(
+            f"Booking modal stayed at {when_text or 'unknown time'} / {where_text or 'unknown side'} "
+            f"instead of {target_time} / {where_value}."
+        )
+
+    def _control_near_label(
+        self,
+        root_control: object,
+        label_text: str,
+        control_type: str,
+    ) -> object | None:
+        label_rect = self._first_text_rectangle(root_control, [rf"^{re.escape(label_text)}$"])
+        if label_rect is None:
+            return None
+
+        candidates = []
+        label_center_y = (label_rect.top + label_rect.bottom) // 2
+        for control in self._descendants(root_control, control_type=control_type):
+            if not self._is_actionable(control):
+                continue
+            rectangle = self._safe_rectangle(control)
+            if rectangle is None or rectangle.left < label_rect.right:
+                continue
+            control_center_y = (rectangle.top + rectangle.bottom) // 2
+            y_distance = abs(control_center_y - label_center_y)
+            if y_distance <= 35:
+                candidates.append((y_distance, rectangle.left, control))
+
+        if not candidates:
+            return None
+
+        _, _, control = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
+        return control
+
+    def _combo_text(self, combo_box: object) -> str:
+        try:
+            return str(combo_box.selected_text())
+        except Exception:
+            pass
+
+        try:
+            legacy_value = combo_box.legacy_properties().get("Value")
+            if legacy_value:
+                return str(legacy_value)
+        except Exception:
+            pass
+
+        return self._text_of(combo_box)
+
+    def _current_booking_modal(self) -> object:
+        for window in self._visible_windows(app_only=True):
+            combined = "\n".join(self._control_texts(window)).upper()
+            if "RESERVE" in combined and "SELECT PLAYERS" in combined and "SELECT HOLES" in combined:
+                return window
+        raise ClubCaddieAutomationError("Booking modal is not visible.")
+
+    def _select_booking_option(self, modal: object, label_text: str, option_text: str) -> None:
+        if not self._click_option_near_label(modal, label_text, option_text):
+            raise ClubCaddieAutomationError(f"Could not select {label_text}: {option_text}")
+        time.sleep(0.3)
+
+    def _click_option_near_label(self, modal: object, label_text: str, option_text: str) -> bool:
+        label_rect = self._first_text_rectangle(modal, [rf"^{re.escape(label_text)}$"])
+        if label_rect is None:
+            return self._click_first_match(modal, [rf"^{re.escape(option_text)}$"])
+
+        candidates = []
+        for control in self._descendants(modal):
+            if not self._is_visible(control) or self._text_of(control) != option_text:
+                continue
+            rectangle = self._safe_rectangle(control)
+            if rectangle is None:
+                continue
+            if abs(((rectangle.top + rectangle.bottom) // 2) - ((label_rect.top + label_rect.bottom) // 2)) <= 35:
+                candidates.append((rectangle.left, control))
+
+        if not candidates:
+            return False
+
+        _, control = sorted(candidates, key=lambda item: item[0])[0]
+        self._invoke_or_click(control)
+        return True
+
+    def _first_text_rectangle(self, root_control: object, text_patterns: Iterable[str]) -> object | None:
+        for control in self._descendants(root_control):
+            if self._is_visible(control) and self._text_matches(control, text_patterns):
+                return self._safe_rectangle(control)
+        return None
+
+    def _fill_booking_player_rows(self, modal: object, booking: TeeSheetBookingRequest) -> None:
+        row_edits = self._booking_row_edits(modal)
+        if len(row_edits) < len(booking.players):
+            raise ClubCaddieAutomationError("Not enough visible booking player rows were found.")
+
+        for player_index, player in enumerate(booking.players):
+            columns = row_edits[player_index]
+            self._set_edit_text(columns[0], player.last_name)
+            self._set_edit_text(columns[1], player.first_name)
+            if player.email and len(columns) > 3:
+                self._set_edit_text(columns[3], str(player.email))
+            if player.mobile_number and len(columns) > 4:
+                self._set_edit_text(columns[4], player.mobile_number)
+
+    def _booking_row_edits(self, modal: object) -> list[list[object]]:
+        data_items = [
+            item
+            for item in self._descendants(modal, control_type="DataItem")
+            if self._is_visible(item)
+            and "PlayerDetail" in self._text_of(item)
+        ]
+        rows: list[list[object]] = []
+
+        for data_item in sorted(data_items, key=lambda item: self._safe_rectangle(item).top):
+            row_rectangle = self._safe_rectangle(data_item)
+            if row_rectangle is None:
+                continue
+
+            edits = []
+            for edit in self._descendants(data_item, control_type="Edit"):
+                edit_rectangle = self._safe_rectangle(edit)
+                if (
+                    self._is_actionable(edit)
+                    and edit_rectangle is not None
+                    and edit_rectangle.top < row_rectangle.top + 35
+                ):
+                    edits.append(edit)
+            edits.sort(key=lambda edit: self._safe_rectangle(edit).left)
+            if len(edits) >= 5:
+                rows.append(edits)
+
+        return rows
+
+    def _submit_booking_modal(self, booking: TeeSheetBookingRequest) -> None:
+        modal = self._current_booking_modal()
+        target_time = self._normalize_time(booking.time)
+        where_value = "Front" if booking.side == "front" else "Back"
+        self._verify_booking_when_and_where(modal, target_time, where_value)
+        if not self._click_first_match(modal, [r"^Reserve$"]):
+            raise ClubCaddieAutomationError("Reserve button was not found.")
+        self._wait_for_booking_modal_closed(booking)
+
+    def _wait_for_booking_modal_closed(self, booking: TeeSheetBookingRequest) -> None:
+        deadline = time.monotonic() + self.settings.window_wait_seconds
+        while time.monotonic() < deadline:
+            try:
+                self._current_booking_modal()
+            except ClubCaddieAutomationError:
+                return
+            time.sleep(0.5)
+        raise ClubCaddieAutomationError("Reservation modal did not close after Reserve.")
+
+    def _close_booking_modal_if_present(self) -> None:
+        try:
+            modal = self._current_booking_modal()
+        except ClubCaddieAutomationError:
+            return
+        self._click_first_match(modal, [r"^OK$"])
+        time.sleep(0.2)
+        self._click_first_match(modal, [r"^Cancel$", r"^Close$"])
+        time.sleep(0.5)
+
+    def _booking_response(
+        self,
+        booking: TeeSheetBookingRequest,
+        status: BookingStatus,
+        message: str,
+        warnings: list[str],
+    ) -> TeeSheetBookingResponse:
+        return TeeSheetBookingResponse(
+            date=booking.date,
+            side=booking.side,
+            time=self._normalize_time(booking.time),
+            holes=booking.holes,
+            player_count=len(booking.players),
+            status=status,
+            message=message,
             warnings=warnings,
         )
 
@@ -899,6 +1354,10 @@ class ClubCaddieAutomation:
     def _window_contains_text(self, window: object, expected_texts: Iterable[str]) -> bool:
         combined = "\n".join(self._control_texts(window)).upper()
         return all(expected.upper() in combined for expected in expected_texts)
+
+    def _window_contains_any_text(self, window: object, expected_texts: Iterable[str]) -> bool:
+        combined = "\n".join(self._control_texts(window)).upper()
+        return any(expected.upper() in combined for expected in expected_texts)
 
     def _control_texts(self, root_control: object) -> list[str]:
         texts = []

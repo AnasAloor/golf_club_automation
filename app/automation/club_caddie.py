@@ -200,7 +200,7 @@ class ClubCaddieAutomation:
 
         home_window = self._find_window(
             [r".*Tee.*", r".*Rolling.*", r".*Club.*", r".*Caddie.*"],
-            timeout_seconds=5,
+            timeout_seconds=self.settings.window_wait_seconds,
         )
         if home_window is None:
             app_windows = self._visible_windows(app_only=True)
@@ -256,16 +256,20 @@ class ClubCaddieAutomation:
 
         if target_edit is None:
             raise ClubCaddieAutomationError("Tee Sheet date input was not found.")
-        if not self._is_enabled(target_edit):
+        if self._is_enabled(target_edit):
             try:
-                self._select_date_with_calendar(tee_window, target_edit, target_date)
+                self._set_edit_text(target_edit, date_text)
+                target_edit.type_keys("{ENTER}", set_foreground=True)
+                self._wait_for_visible_date(tee_window, target_date, timeout_seconds=5)
+                return
             except ClubCaddieAutomationError:
-                self._navigate_date_with_arrows(tee_window, target_edit, target_date)
-            return
+                pass
 
-        self._set_edit_text(target_edit, date_text)
-        target_edit.type_keys("{ENTER}", set_foreground=True)
-        time.sleep(2)
+        try:
+            self._select_date_with_calendar(tee_window, target_edit, target_date)
+            return
+        except ClubCaddieAutomationError:
+            self._navigate_date_with_arrows(tee_window, target_edit, target_date)
 
     def _looks_like_date_field(self, text: str) -> bool:
         return bool(re.search(r"\d{1,2}/\d{1,2}/\d{4}", text))
@@ -299,7 +303,8 @@ class ClubCaddieAutomation:
             return
 
         if not self._click_first_match(tee_window, [r"^Show Calendar$"]):
-            raise ClubCaddieAutomationError("Show Calendar button was not found.")
+            if not self._click_calendar_button_by_position(tee_window):
+                raise ClubCaddieAutomationError("Show Calendar button was not found.")
 
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -308,6 +313,36 @@ class ClubCaddieAutomation:
             time.sleep(0.25)
 
         raise ClubCaddieAutomationError("Calendar did not open.")
+
+    def _click_calendar_button_by_position(self, tee_window: object) -> bool:
+        date_edits = [
+            edit
+            for edit in self._descendants(tee_window, control_type="Edit")
+            if self._is_visible(edit) and self._looks_like_date_field(self._text_of(edit))
+        ]
+        if not date_edits:
+            return False
+
+        date_rect = self._safe_rectangle(date_edits[0])
+        if date_rect is None:
+            return False
+
+        for button in self._descendants(tee_window, control_type="Button"):
+            rectangle = self._safe_rectangle(button)
+            if rectangle is None or not self._is_visible(button):
+                continue
+            vertically_aligned = abs(
+                ((rectangle.top + rectangle.bottom) // 2)
+                - ((date_rect.top + date_rect.bottom) // 2)
+            ) <= 20
+            near_right_edge = date_rect.right <= rectangle.left <= date_rect.right + 40
+            if vertically_aligned and near_right_edge:
+                x = (rectangle.left + rectangle.right) // 2
+                y = (rectangle.top + rectangle.bottom) // 2
+                mouse.click(button="left", coords=(x, y))
+                return True
+
+        return False
 
     def _is_calendar_visible(self, tee_window: object) -> bool:
         return any(
@@ -384,9 +419,14 @@ class ClubCaddieAutomation:
             raise ClubCaddieAutomationError("Tee Sheet previous/next date buttons were not found.")
         return buttons[0], buttons[1]
 
-    def _wait_for_visible_date(self, tee_window: object, target_date: date) -> None:
+    def _wait_for_visible_date(
+        self,
+        tee_window: object,
+        target_date: date,
+        timeout_seconds: int | None = None,
+    ) -> None:
         expected = f"{target_date.month}/{target_date.day}/{target_date.year}"
-        deadline = time.monotonic() + self.settings.window_wait_seconds
+        deadline = time.monotonic() + (timeout_seconds or self.settings.window_wait_seconds)
         while time.monotonic() < deadline:
             for edit in self._descendants(tee_window, control_type="Edit"):
                 if self._is_visible(edit) and self._text_of(edit) == expected:
@@ -450,7 +490,9 @@ class ClubCaddieAutomation:
                 click_coords = self._find_add_button_coords(image, booking.side, target_time)
             if click_coords is not None:
                 mouse.click(button="left", coords=click_coords)
-                self._wait_for_any_booking_modal()
+                if not self._wait_for_booking_modal_after_click(timeout_seconds=3):
+                    mouse.double_click(button="left", coords=click_coords)
+                    self._wait_for_any_booking_modal()
                 return
 
             front, back = self._ocr_slots_from_full_grid(
@@ -509,23 +551,35 @@ class ClubCaddieAutomation:
         scaled = side_image.convert("L").resize((side_image.size[0] * 2, side_image.size[1] * 2))
         ocr_data = pytesseract.image_to_data(scaled, output_type=pytesseract.Output.DICT, config="--psm 11")
         time_words = []
+        add_words = []
 
         for index, text in enumerate(ocr_data["text"]):
             word_text = str(text).strip()
-            if self._normalize_time_or_none(word_text) != target_time:
-                continue
-
             left = int(ocr_data["left"][index]) / 2 + side_left
             top = int(ocr_data["top"][index]) / 2
+            word_width = int(ocr_data["width"][index]) / 2
             word_height = int(ocr_data["height"][index]) / 2
-            time_words.append((left, top + word_height / 2))
+            center_y = top + word_height / 2
+
+            if self._ocr_time_matches_target(word_text, target_time):
+                time_words.append((left, center_y))
+            elif word_text.lower() == "add":
+                add_words.append((left + word_width / 2, center_y))
 
         if not time_words:
             return None
 
         time_left, row_center_y = sorted(time_words, key=lambda item: item[0])[0]
-        add_x = time_left + 45
-        return int(add_x), int(row_center_y)
+        row_add_words = [
+            (add_x, add_y)
+            for add_x, add_y in add_words
+            if add_x > time_left and abs(add_y - row_center_y) <= 30
+        ]
+        if row_add_words:
+            add_x, add_y = sorted(row_add_words, key=lambda item: item[0])[0]
+            return int(add_x), int(add_y)
+
+        return int(time_left + 80), int(row_center_y)
 
     def _find_add_button_coords(
         self,
@@ -545,7 +599,7 @@ class ClubCaddieAutomation:
 
         for row in time_rows:
             row_text = " ".join(word["text"] for word in row)
-            if self._normalize_time_or_none(row_text) != target_time:
+            if not self._ocr_time_matches_target(row_text, target_time):
                 continue
             if "add" not in row_text.lower():
                 raise ClubCaddieAutomationError(f"Slot {side} {target_time} does not appear available.")
@@ -594,6 +648,17 @@ class ClubCaddieAutomation:
             return None
         return self._normalize_time(match.group(0))
 
+    def _ocr_time_matches_target(self, text: str, target_time: str) -> bool:
+        normalized_time = self._normalize_time_or_none(text)
+        if normalized_time is not None:
+            return normalized_time == target_time
+
+        time_without_meridiem = re.search(r"\b(?:[1-9]|1[0-2]):[0-5]\d\b", text)
+        if time_without_meridiem is None:
+            return False
+
+        return time_without_meridiem.group(0).lstrip("0") == target_time.rsplit(" ", 1)[0].lstrip("0")
+
     def _wait_for_booking_modal(self, target_time: str) -> object:
         deadline = time.monotonic() + self.settings.window_wait_seconds
         while time.monotonic() < deadline:
@@ -614,23 +679,35 @@ class ClubCaddieAutomation:
                 time.sleep(0.5)
         raise ClubCaddieAutomationError("Booking modal did not open.")
 
+    def _wait_for_booking_modal_after_click(self, timeout_seconds: int) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                self._current_booking_modal()
+                return True
+            except ClubCaddieAutomationError:
+                time.sleep(0.25)
+        return False
+
     def _fill_booking_modal(self, booking: TeeSheetBookingRequest) -> None:
         modal = self._current_booking_modal()
         self._focus_window(modal)
         self._set_booking_when_and_where(modal, booking)
         self._select_booking_option(modal, "Select Holes", str(booking.holes))
         self._select_booking_option(modal, "Select Players", str(len(booking.players)))
+        self._set_booking_when_and_where(modal, booking)
+        self._verify_booking_holes(modal, booking.holes)
         self._fill_booking_player_rows(modal, booking)
 
     def _set_booking_when_and_where(self, modal: object, booking: TeeSheetBookingRequest) -> None:
         target_time = self._normalize_time(booking.time)
-        when_edit = self._control_near_label(modal, "When", "Edit")
+        when_edit = self._wait_for_control_near_label(modal, "When", "Edit")
         if when_edit is None:
             raise ClubCaddieAutomationError("Booking modal When field was not found.")
         self._replace_edit_text(when_edit, target_time)
 
         where_value = "Front" if booking.side == "front" else "Back"
-        where_combo = self._control_near_label(modal, "Where", "ComboBox")
+        where_combo = self._wait_for_control_near_label(modal, "Where", "ComboBox")
         if where_combo is None:
             raise ClubCaddieAutomationError("Booking modal Where field was not found.")
         self._select_combo_value(where_combo, where_value)
@@ -673,34 +750,122 @@ class ClubCaddieAutomation:
             f"instead of {target_time} / {where_value}."
         )
 
+    def _verify_booking_holes(self, modal: object, holes: int) -> None:
+        if self._is_option_selected_near_label(modal, "Select Holes", str(holes)):
+            return
+
+        expected_class_prefix = "18 " if holes == 18 else "9 "
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            class_texts = [
+                self._text_of(control)
+                for control in self._descendants(modal)
+                if self._is_visible(control)
+                and self._safe_rectangle(control) is not None
+                and "ride" in self._text_of(control).lower()
+            ]
+            if any(text.strip().lower().startswith(expected_class_prefix) for text in class_texts):
+                return
+            time.sleep(0.2)
+
+        raise ClubCaddieAutomationError(f"Booking modal did not apply {holes} holes.")
+
+    def _is_option_selected_near_label(self, modal: object, label_text: str, option_text: str) -> bool:
+        label_rect = self._first_text_rectangle(modal, [rf"^{re.escape(label_text)}$"])
+        if label_rect is None:
+            return False
+
+        label_center_y = (label_rect.top + label_rect.bottom) // 2
+        for control in self._descendants(modal):
+            if not self._is_visible(control) or self._text_of(control) != option_text:
+                continue
+            rectangle = self._safe_rectangle(control)
+            if rectangle is None or not self._has_size(rectangle):
+                continue
+            control_center_y = (rectangle.top + rectangle.bottom) // 2
+            if abs(control_center_y - label_center_y) > 35 or rectangle.left < label_rect.right:
+                continue
+            if self._is_selected(control):
+                return True
+
+        return False
+
+    def _is_selected(self, control: object) -> bool:
+        try:
+            return bool(control.get_toggle_state())
+        except Exception:
+            pass
+
+        try:
+            return bool(control.iface_selection_item.CurrentIsSelected)
+        except Exception:
+            pass
+
+        try:
+            return "checked" in str(control.legacy_properties().get("State", "")).lower()
+        except Exception:
+            return False
+
+    def _wait_for_control_near_label(
+        self,
+        root_control: object,
+        label_text: str,
+        control_type: str,
+        timeout_seconds: int = 5,
+    ) -> object | None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            control = self._control_near_label(root_control, label_text, control_type)
+            if control is not None:
+                return control
+            time.sleep(0.2)
+        return None
+
     def _control_near_label(
         self,
         root_control: object,
         label_text: str,
         control_type: str,
     ) -> object | None:
-        label_rect = self._first_text_rectangle(root_control, [rf"^{re.escape(label_text)}$"])
-        if label_rect is None:
+        candidates = []
+        label_rectangles = [
+            rectangle
+            for control in self._descendants(root_control)
+            if self._is_visible(control)
+            and self._text_matches(control, [rf"^{re.escape(label_text)}$"])
+            and (rectangle := self._safe_rectangle(control)) is not None
+            and self._has_size(rectangle)
+        ]
+        if not label_rectangles:
             return None
 
-        candidates = []
-        label_center_y = (label_rect.top + label_rect.bottom) // 2
-        for control in self._descendants(root_control, control_type=control_type):
-            if not self._is_actionable(control):
-                continue
-            rectangle = self._safe_rectangle(control)
-            if rectangle is None or rectangle.left < label_rect.right:
-                continue
-            control_center_y = (rectangle.top + rectangle.bottom) // 2
-            y_distance = abs(control_center_y - label_center_y)
-            if y_distance <= 35:
-                candidates.append((y_distance, rectangle.left, control))
+        controls = [
+            control
+            for control in self._descendants(root_control, control_type=control_type)
+            if self._is_actionable(control)
+        ]
+        for label_rect in label_rectangles:
+            label_center_y = (label_rect.top + label_rect.bottom) // 2
+            for control in controls:
+                rectangle = self._safe_rectangle(control)
+                if rectangle is None or not self._has_size(rectangle):
+                    continue
+                if rectangle.left + 5 < label_rect.right:
+                    continue
+                control_center_y = (rectangle.top + rectangle.bottom) // 2
+                y_distance = abs(control_center_y - label_center_y)
+                if y_distance <= 35:
+                    x_distance = abs(rectangle.left - label_rect.right)
+                    candidates.append((y_distance, x_distance, rectangle.left, control))
 
         if not candidates:
             return None
 
-        _, _, control = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
+        _, _, _, control = sorted(candidates, key=lambda item: (item[0], item[1], item[2]))[0]
         return control
+
+    def _has_size(self, rectangle: object) -> bool:
+        return rectangle.right > rectangle.left and rectangle.bottom > rectangle.top
 
     def _combo_text(self, combo_box: object) -> str:
         try:
@@ -739,7 +904,7 @@ class ClubCaddieAutomation:
             if not self._is_visible(control) or self._text_of(control) != option_text:
                 continue
             rectangle = self._safe_rectangle(control)
-            if rectangle is None:
+            if rectangle is None or not self._has_size(rectangle):
                 continue
             if abs(((rectangle.top + rectangle.bottom) // 2) - ((label_rect.top + label_rect.bottom) // 2)) <= 35:
                 candidates.append((rectangle.left, control))
@@ -754,7 +919,9 @@ class ClubCaddieAutomation:
     def _first_text_rectangle(self, root_control: object, text_patterns: Iterable[str]) -> object | None:
         for control in self._descendants(root_control):
             if self._is_visible(control) and self._text_matches(control, text_patterns):
-                return self._safe_rectangle(control)
+                rectangle = self._safe_rectangle(control)
+                if rectangle is not None and self._has_size(rectangle):
+                    return rectangle
         return None
 
     def _fill_booking_player_rows(self, modal: object, booking: TeeSheetBookingRequest) -> None:
@@ -805,6 +972,7 @@ class ClubCaddieAutomation:
         target_time = self._normalize_time(booking.time)
         where_value = "Front" if booking.side == "front" else "Back"
         self._verify_booking_when_and_where(modal, target_time, where_value)
+        self._verify_booking_holes(modal, booking.holes)
         if not self._click_first_match(modal, [r"^Reserve$"]):
             raise ClubCaddieAutomationError("Reserve button was not found.")
         self._wait_for_booking_modal_closed(booking)
@@ -826,7 +994,7 @@ class ClubCaddieAutomation:
             return
         self._click_first_match(modal, [r"^OK$"])
         time.sleep(0.2)
-        self._click_first_match(modal, [r"^Cancel$", r"^Close$"])
+        self._click_first_match(modal, [r"^Cancel$"])
         time.sleep(0.5)
 
     def _booking_response(

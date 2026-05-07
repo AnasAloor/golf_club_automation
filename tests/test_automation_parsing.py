@@ -19,6 +19,7 @@ class FakeControl:
         children: list["FakeControl"] | None = None,
         control_type: str | None = None,
         rectangle: FakeRectangle | None = None,
+        selected: bool = False,
     ) -> None:
         self.text = text
         self.visible = visible
@@ -26,6 +27,7 @@ class FakeControl:
         self.children = children or []
         self.control_type = control_type
         self._rectangle = rectangle
+        self.selected = selected
         self.clicked = False
 
     def window_text(self) -> str:
@@ -51,6 +53,9 @@ class FakeControl:
         if self._rectangle is None:
             raise RuntimeError("No rectangle configured.")
         return self._rectangle
+
+    def get_toggle_state(self) -> int:
+        return int(self.selected)
 
     def invoke(self) -> None:
         self.clicked = True
@@ -166,6 +171,11 @@ def test_booking_row_edits_ignore_notes_field_below_player_row() -> None:
 
 def test_control_near_label_targets_matching_row_control() -> None:
     automation = automation_without_desktop()
+    hidden_duplicate_where = FakeControl(
+        "Where",
+        control_type="Text",
+        rectangle=FakeRectangle(0, 0, 0, 0),
+    )
     background_date = FakeControl(
         "10/5/2026",
         control_type="Edit",
@@ -178,6 +188,7 @@ def test_control_near_label_targets_matching_row_control() -> None:
     unrelated_combo = FakeControl("Back", control_type="ComboBox", rectangle=FakeRectangle(260, 300, 350, 332))
     modal = FakeControl(
         children=[
+            hidden_duplicate_where,
             background_date,
             when_label,
             when_edit,
@@ -189,3 +200,28 @@ def test_control_near_label_targets_matching_row_control() -> None:
 
     assert automation._control_near_label(modal, "When", "Edit") is when_edit
     assert automation._control_near_label(modal, "Where", "ComboBox") is where_combo
+
+
+def test_holes_verification_uses_selected_radio_state() -> None:
+    automation = automation_without_desktop()
+    select_holes_label = FakeControl(
+        "Select Holes",
+        control_type="Text",
+        rectangle=FakeRectangle(729, 480, 805, 518),
+    )
+    nine = FakeControl(
+        "9",
+        control_type="RadioButton",
+        rectangle=FakeRectangle(810, 484, 845, 514),
+        selected=False,
+    )
+    eighteen = FakeControl(
+        "18",
+        control_type="RadioButton",
+        rectangle=FakeRectangle(850, 484, 885, 514),
+        selected=True,
+    )
+    modal = FakeControl(children=[select_holes_label, nine, eighteen])
+
+    assert automation._is_option_selected_near_label(modal, "Select Holes", "18")
+    assert not automation._is_option_selected_near_label(modal, "Select Holes", "9")

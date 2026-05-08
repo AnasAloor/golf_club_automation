@@ -1,6 +1,8 @@
 from datetime import date
 
-from app.automation.club_caddie import ClubCaddieAutomation
+import pytest
+
+from app.automation.club_caddie import ClubCaddieAutomation, ClubCaddieAutomationError
 from app.schemas import SlotStatus, TeeSlot
 
 
@@ -140,6 +142,39 @@ def test_normalizes_time_labels() -> None:
     assert automation._normalize_time("06:44am") == "6:44 AM"
 
 
+def test_regional_24_hour_times_match_booking_times() -> None:
+    automation = automation_without_desktop()
+
+    assert automation._time_text_matches_target("08:20", "8:20 AM")
+    assert automation._time_text_matches_target("17:40", "5:40 PM")
+    assert not automation._time_text_matches_target("08:20", "8:20 PM")
+
+
+def test_turn_time_zero_accepts_24_hour_and_midnight_text() -> None:
+    automation = automation_without_desktop()
+
+    assert automation._turn_time_is_zero("00:00")
+    assert automation._turn_time_is_zero("12:00 AM")
+    assert not automation._turn_time_is_zero("09:00")
+
+
+def test_image_coords_are_translated_to_screen_coords() -> None:
+    automation = automation_without_desktop()
+    window = FakeControl(rectangle=FakeRectangle(-33, 50, 2527, 1442))
+
+    assert automation._image_coords_to_screen(window, (1384, 463)) == (1351, 513)
+
+
+def test_time_only_ocr_row_clicks_target_row() -> None:
+    automation = automation_without_desktop()
+    row = [
+        {"text": "5:40", "center_x": 1317.2, "center_y": 842.5},
+        {"text": "PM", "center_x": 1344.0, "center_y": 842.2},
+    ]
+
+    assert automation._time_row_fallback_coords(row, "back", 2560) == (1397, 842)
+
+
 def test_parses_multiple_visible_date_formats() -> None:
     automation = automation_without_desktop()
 
@@ -157,6 +192,25 @@ def test_formats_target_date_like_visible_field() -> None:
     assert automation._format_date_for_visible_field(target_date, "5/8/2026") == "10/6/2026"
     assert automation._format_date_for_visible_field(target_date, "08-05-2026") == "06-10-2026"
     assert automation._format_date_for_visible_field(target_date, "08-May-2026") == "06-Oct-2026"
+
+
+def test_calendar_day_labels_include_ec2_day_first_format() -> None:
+    automation = automation_without_desktop()
+
+    labels = automation._calendar_day_labels(date(2026, 10, 6))
+
+    assert "Tuesday, October 6, 2026" in labels
+    assert "Tuesday, 06 October 2026" in labels
+    assert "06 October 2026" in labels
+
+
+def test_arrow_navigation_rejects_large_date_jumps() -> None:
+    automation = automation_without_desktop()
+    tee_window = FakeControl()
+    date_edit = FakeControl("08-05-2026")
+
+    with pytest.raises(ClubCaddieAutomationError, match="calendar selection is required"):
+        automation._navigate_date_with_arrows(tee_window, date_edit, date(2026, 10, 6))
 
 
 def test_booking_row_edits_ignore_notes_field_below_player_row() -> None:

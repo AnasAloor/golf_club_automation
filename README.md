@@ -53,6 +53,50 @@ GCA_PASSWORD=0000
 GCA_WINDOW_WAIT_SECONDS=60
 ```
 
+## Windows Date And Time Region Settings
+
+For the most reliable automation, use the same Windows regional format on local machines and EC2.
+
+Recommended Windows setup:
+
+1. Open **Settings**.
+2. Go to **Time & language**.
+3. Open **Language & region**.
+4. Set **Regional format** to **English (India)**.
+5. Open **Administrative language settings** or **Additional date, time & regional settings**.
+6. In **Region > Formats > Additional settings**, use these values:
+
+```text
+Short date: dd-MM-yyyy
+Long date: dd MMMM yyyy
+Short time: h:mm tt
+Long time: h:mm:ss tt
+AM symbol: AM
+PM symbol: PM
+```
+
+This matches the EC2-style date format used during testing, for example `06-10-2026` and `06 October 2026`.
+
+After changing region settings, restart Club Caddie and restart the FastAPI server.
+
+API payloads do not use the Windows display date format. Always send:
+
+```text
+date: YYYY-MM-DD
+time: h:mm AM/PM
+```
+
+Example:
+
+```json
+{
+  "date": "2026-10-06",
+  "time": "6:52 AM"
+}
+```
+
+The automation can read common Windows display formats such as `10/6/2026`, `06-10-2026`, `06-Oct-2026`, and 24-hour visible times like `17:40`, but the API request time must still include `AM` or `PM`.
+
 ## Run The API
 
 Start the backend from the project root:
@@ -173,7 +217,8 @@ Example 4-player payload:
     }
   ],
   "dry_run": false
-}```
+}
+```
 
 Successful dry-run response:
 

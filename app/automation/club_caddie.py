@@ -292,9 +292,10 @@ class ClubCaddieAutomation:
                 raise ClubCaddieAutomationError("Calendar month navigation button was not found.")
             time.sleep(0.2)
 
-        target_label = self._calendar_day_label(target_date)
-        if not self._click_first_match(tee_window, [f"^{re.escape(target_label)}$"]):
-            raise ClubCaddieAutomationError(f"Calendar day button was not found: {target_label}")
+        if not self._click_calendar_day(tee_window, target_date):
+            raise ClubCaddieAutomationError(
+                f"Calendar day button was not found for {target_date.isoformat()}."
+            )
 
         self._wait_for_visible_date(tee_window, target_date)
 
@@ -358,6 +359,51 @@ class ClubCaddieAutomation:
             f"{target_date.year}"
         )
 
+    def _calendar_day_labels(self, target_date: date) -> list[str]:
+        return [
+            self._calendar_day_label(target_date),
+            f"{target_date.strftime('%A')}, {target_date.day:02d} {target_date.strftime('%B')} {target_date.year}",
+            f"{target_date.day:02d} {target_date.strftime('%B')} {target_date.year}",
+            f"{target_date.day} {target_date.strftime('%B')} {target_date.year}",
+            f"{target_date.strftime('%B')} {target_date.day}, {target_date.year}",
+        ]
+
+    def _click_calendar_day(self, tee_window: object, target_date: date) -> bool:
+        if self._click_first_match(
+            tee_window,
+            [f"^{re.escape(label)}$" for label in self._calendar_day_labels(target_date)],
+        ):
+            return True
+
+        day_texts = {str(target_date.day), f"{target_date.day:02d}"}
+        visible_calendar_rectangles = [
+            rectangle
+            for calendar in self._descendants(tee_window, control_type="Calendar")
+            if self._is_visible(calendar)
+            and (rectangle := self._safe_rectangle(calendar)) is not None
+            and self._has_size(rectangle)
+        ]
+
+        for control in self._descendants(tee_window):
+            if not self._is_visible(control) or self._text_of(control).strip() not in day_texts:
+                continue
+            rectangle = self._safe_rectangle(control)
+            if rectangle is None or not self._has_size(rectangle):
+                continue
+            if visible_calendar_rectangles and not any(
+                calendar_rect.left <= rectangle.left <= calendar_rect.right
+                and calendar_rect.top <= rectangle.top <= calendar_rect.bottom
+                for calendar_rect in visible_calendar_rectangles
+            ):
+                continue
+
+            x = (rectangle.left + rectangle.right) // 2
+            y = (rectangle.top + rectangle.bottom) // 2
+            mouse.click(button="left", coords=(x, y))
+            return True
+
+        return False
+
     def _navigate_date_with_arrows(
         self,
         tee_window: object,
@@ -368,6 +414,11 @@ class ClubCaddieAutomation:
         day_delta = (target_date - current_date).days
         if day_delta == 0:
             return
+        if abs(day_delta) > 31:
+            raise ClubCaddieAutomationError(
+                f"Tee Sheet date {target_date.isoformat()} is {abs(day_delta)} days away; "
+                "calendar selection is required."
+            )
 
         prev_button, next_button = self._date_arrow_buttons(tee_window, date_edit)
         button = next_button if day_delta > 0 else prev_button
@@ -579,9 +630,10 @@ class ClubCaddieAutomation:
             if click_coords is None:
                 click_coords = self._find_add_button_coords(image, booking.side, target_time)
             if click_coords is not None:
-                mouse.click(button="left", coords=click_coords)
+                screen_coords = self._image_coords_to_screen(tee_window, click_coords)
+                mouse.click(button="left", coords=screen_coords)
                 if not self._wait_for_booking_modal_after_click(timeout_seconds=3):
-                    mouse.double_click(button="left", coords=click_coords)
+                    mouse.double_click(button="left", coords=screen_coords)
                     self._wait_for_any_booking_modal()
                 return
 
@@ -611,6 +663,17 @@ class ClubCaddieAutomation:
         raise ClubCaddieAutomationError(
             f"Available Add button was not found for {booking.side} {target_time}."
         )
+
+    def _image_coords_to_screen(
+        self,
+        window: object,
+        coords: tuple[int, int],
+    ) -> tuple[int, int]:
+        rectangle = self._safe_rectangle(window)
+        if rectangle is None:
+            return coords
+
+        return rectangle.left + coords[0], rectangle.top + coords[1]
 
     def _find_any_visible_available_slot_coords(
         self,
@@ -692,13 +755,31 @@ class ClubCaddieAutomation:
             if not self._ocr_time_matches_target(row_text, target_time):
                 continue
             if "add" not in row_text.lower():
-                raise ClubCaddieAutomationError(f"Slot {side} {target_time} does not appear available.")
+                if self._has_non_button_booking_text(row_text):
+                    raise ClubCaddieAutomationError(f"Slot {side} {target_time} does not appear available.")
+                return self._time_row_fallback_coords(row, side, width)
 
             add_words = [word for word in row if word["text"].lower() == "add"]
             add_word = add_words[0] if add_words else row[-1]
             return int(add_word["center_x"]), int(add_word["center_y"])
 
         return None
+
+    def _time_row_fallback_coords(
+        self,
+        row: list[dict[str, object]],
+        side: str,
+        image_width: int,
+    ) -> tuple[int, int]:
+        side_left = 0 if side == "front" else image_width // 2
+        side_width = image_width // 2
+        time_left = min(float(word["center_x"]) for word in row)
+        row_center_y = sum(float(word["center_y"]) for word in row) / len(row)
+        preferred_x = int(time_left + 80)
+        min_x = int(side_left + side_width * 0.04)
+        max_x = int(side_left + side_width * 0.45)
+
+        return min(max(preferred_x, min_x), max_x), int(row_center_y)
 
     def _ocr_word_rows(
         self,
@@ -738,10 +819,32 @@ class ClubCaddieAutomation:
             return None
         return self._normalize_time(match.group(0))
 
+    def _time_minutes_or_none(self, text: str) -> int | None:
+        normalized_time = self._normalize_time_or_none(text)
+        if normalized_time is not None:
+            parsed = datetime.strptime(normalized_time, "%I:%M %p")
+            return parsed.hour * 60 + parsed.minute
+
+        match = re.search(r"\b(?P<hour>[01]?\d|2[0-3]):(?P<minute>[0-5]\d)\b", text)
+        if match is None:
+            return None
+
+        return int(match.group("hour")) * 60 + int(match.group("minute"))
+
+    def _time_text_matches_target(self, text: str, target_time: str) -> bool:
+        visible_minutes = self._time_minutes_or_none(text)
+        target_minutes = self._time_minutes_or_none(target_time)
+        return visible_minutes is not None and visible_minutes == target_minutes
+
     def _ocr_time_matches_target(self, text: str, target_time: str) -> bool:
         normalized_time = self._normalize_time_or_none(text)
         if normalized_time is not None:
             return normalized_time == target_time
+
+        time_minutes = self._time_minutes_or_none(text)
+        target_minutes = self._time_minutes_or_none(target_time)
+        if time_minutes is not None and target_minutes is not None:
+            return time_minutes == target_minutes
 
         time_without_meridiem = re.search(r"\b(?:[1-9]|1[0-2]):[0-5]\d\b", text)
         if time_without_meridiem is None:
@@ -784,8 +887,10 @@ class ClubCaddieAutomation:
         self._focus_window(modal)
         self._set_booking_when_and_where(modal, booking)
         self._select_booking_option(modal, "Select Holes", str(booking.holes))
+        self._set_booking_turn_time_to_zero_if_needed(modal, booking)
         self._select_booking_option(modal, "Select Players", str(len(booking.players)))
         self._set_booking_when_and_where(modal, booking)
+        self._set_booking_turn_time_to_zero_if_needed(modal, booking)
         self._verify_booking_holes(modal, booking.holes)
         self._fill_booking_player_rows(modal, booking)
 
@@ -831,7 +936,7 @@ class ClubCaddieAutomation:
             where_combo = self._control_near_label(modal, "Where", "ComboBox")
             when_text = self._text_of(when_edit) if when_edit is not None else ""
             where_text = self._combo_text(where_combo) if where_combo is not None else ""
-            if self._normalize_time_or_none(when_text) == target_time and where_value.lower() in where_text.lower():
+            if self._time_text_matches_target(when_text, target_time) and where_value.lower() in where_text.lower():
                 return
             time.sleep(0.2)
 
@@ -839,6 +944,37 @@ class ClubCaddieAutomation:
             f"Booking modal stayed at {when_text or 'unknown time'} / {where_text or 'unknown side'} "
             f"instead of {target_time} / {where_value}."
         )
+
+    def _set_booking_turn_time_to_zero_if_needed(
+        self,
+        modal: object,
+        booking: TeeSheetBookingRequest,
+    ) -> None:
+        if booking.holes != 18:
+            return
+
+        turn_when_edit = self._wait_for_control_near_label(modal, "Turn When", "Edit", timeout_seconds=3)
+        if turn_when_edit is None:
+            raise ClubCaddieAutomationError("Booking modal Turn When field was not found for 18 holes.")
+
+        self._replace_edit_text(turn_when_edit, "00:00")
+        self._verify_booking_turn_time_zero(modal)
+
+    def _verify_booking_turn_time_zero(self, modal: object) -> None:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            turn_when_edit = self._control_near_label(modal, "Turn When", "Edit")
+            turn_when_text = self._text_of(turn_when_edit) if turn_when_edit is not None else ""
+            if self._turn_time_is_zero(turn_when_text):
+                return
+            time.sleep(0.2)
+
+        raise ClubCaddieAutomationError(
+            f"Booking modal Turn When stayed at {turn_when_text or 'unknown time'} instead of 00:00."
+        )
+
+    def _turn_time_is_zero(self, text: str) -> bool:
+        return self._time_minutes_or_none(text) == 0
 
     def _verify_booking_holes(self, modal: object, holes: int) -> None:
         if self._is_option_selected_near_label(modal, "Select Holes", str(holes)):
@@ -1062,6 +1198,8 @@ class ClubCaddieAutomation:
         target_time = self._normalize_time(booking.time)
         where_value = "Front" if booking.side == "front" else "Back"
         self._verify_booking_when_and_where(modal, target_time, where_value)
+        if booking.holes == 18:
+            self._verify_booking_turn_time_zero(modal)
         self._verify_booking_holes(modal, booking.holes)
         if not self._click_first_match(modal, [r"^Reserve$"]):
             raise ClubCaddieAutomationError("Reserve button was not found.")

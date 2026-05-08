@@ -146,6 +146,17 @@ def test_parses_multiple_visible_date_formats() -> None:
     assert automation._parse_date_text("5/8/2026") == date(2026, 5, 8)
     assert automation._parse_date_text("08-May-2026") == date(2026, 5, 8)
     assert automation._parse_date_text("Friday, May 08, 2026") == date(2026, 5, 8)
+    assert automation._parse_date_text("10-06-2026") == date(2026, 6, 10)
+    assert automation._parse_date_text("16-10-2026") == date(2026, 10, 16)
+
+
+def test_formats_target_date_like_visible_field() -> None:
+    automation = automation_without_desktop()
+    target_date = date(2026, 10, 6)
+
+    assert automation._format_date_for_visible_field(target_date, "5/8/2026") == "10/6/2026"
+    assert automation._format_date_for_visible_field(target_date, "08-05-2026") == "06-10-2026"
+    assert automation._format_date_for_visible_field(target_date, "08-May-2026") == "06-Oct-2026"
 
 
 def test_booking_row_edits_ignore_notes_field_below_player_row() -> None:

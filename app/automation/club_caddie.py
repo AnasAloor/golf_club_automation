@@ -238,7 +238,6 @@ class ClubCaddieAutomation:
 
     def _select_date(self, target_date: date) -> None:
         tee_window = self._current_tee_sheet_window()
-        date_text = f"{target_date.month}/{target_date.day}/{target_date.year}"
 
         edits = [
             edit
@@ -258,6 +257,7 @@ class ClubCaddieAutomation:
             raise ClubCaddieAutomationError("Tee Sheet date input was not found.")
         if self._is_enabled(target_edit):
             try:
+                date_text = self._format_date_for_visible_field(target_date, self._text_of(target_edit))
                 self._set_edit_text(target_edit, date_text)
                 target_edit.type_keys("{ENTER}", set_foreground=True)
                 self._wait_for_visible_date(tee_window, target_date, timeout_seconds=5)
@@ -396,15 +396,23 @@ class ClubCaddieAutomation:
         if not normalized:
             return None
 
+        day_first = self._date_text_is_day_first(normalized)
+        numeric_formats = (
+            ("%d/%m/%Y", "%m/%d/%Y")
+            if day_first
+            else ("%m/%d/%Y", "%d/%m/%Y")
+        )
+        for date_format in (*numeric_formats, "%m-%d-%Y" if not day_first else "%d-%m-%Y"):
+            try:
+                return datetime.strptime(normalized, date_format).date()
+            except ValueError:
+                continue
+
         for date_format in (
-            "%m/%d/%Y",
-            "%-m/%-d/%Y",
-            "%d/%m/%Y",
-            "%-d/%-m/%Y",
-            "%m-%d-%Y",
-            "%d-%m-%Y",
             "%d-%b-%Y",
             "%d-%B-%Y",
+            "%m-%d-%Y",
+            "%d-%m-%Y",
             "%b %d %Y",
             "%B %d %Y",
             "%A %b %d %Y",
@@ -435,6 +443,40 @@ class ClubCaddieAutomation:
                     return None
 
         return None
+
+    def _date_text_is_day_first(self, text: str) -> bool:
+        if re.search(r"\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{4}", text):
+            return True
+
+        match = re.search(r"\b(?P<first>\d{1,2})(?P<sep>[/-])(?P<second>\d{1,2})\2\d{4}\b", text)
+        if match is None:
+            return False
+
+        first = int(match.group("first"))
+        second = int(match.group("second"))
+        if first > 12:
+            return True
+        if second > 12:
+            return False
+
+        return match.group("sep") == "-"
+
+    def _format_date_for_visible_field(self, target_date: date, visible_text: str) -> str:
+        normalized = visible_text.strip()
+        if re.search(r"\d{1,2}-[A-Za-z]{3,9}-\d{4}", normalized):
+            return target_date.strftime("%d-%b-%Y")
+        if re.search(r"\d{1,2}/[A-Za-z]{3,9}/\d{4}", normalized):
+            return target_date.strftime("%d/%b/%Y")
+        if re.search(r"\d{1,2}-\d{1,2}-\d{4}", normalized):
+            if self._date_text_is_day_first(normalized):
+                return f"{target_date.day:02d}-{target_date.month:02d}-{target_date.year}"
+            return f"{target_date.month:02d}-{target_date.day:02d}-{target_date.year}"
+        if re.search(r"\d{1,2}/\d{1,2}/\d{4}", normalized):
+            if self._date_text_is_day_first(normalized):
+                return f"{target_date.day:02d}/{target_date.month:02d}/{target_date.year}"
+            return f"{target_date.month}/{target_date.day}/{target_date.year}"
+
+        return f"{target_date.month}/{target_date.day}/{target_date.year}"
 
     def _date_arrow_buttons(self, tee_window: object, date_edit: object) -> tuple[object, object]:
         date_rect = self._safe_rectangle(date_edit)

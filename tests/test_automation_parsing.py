@@ -1,3 +1,5 @@
+from datetime import date
+
 from app.automation.club_caddie import ClubCaddieAutomation
 from app.schemas import SlotStatus, TeeSlot
 
@@ -136,6 +138,14 @@ def test_normalizes_time_labels() -> None:
     automation = automation_without_desktop()
 
     assert automation._normalize_time("06:44am") == "6:44 AM"
+
+
+def test_parses_multiple_visible_date_formats() -> None:
+    automation = automation_without_desktop()
+
+    assert automation._parse_date_text("5/8/2026") == date(2026, 5, 8)
+    assert automation._parse_date_text("08-May-2026") == date(2026, 5, 8)
+    assert automation._parse_date_text("Friday, May 08, 2026") == date(2026, 5, 8)
 
 
 def test_booking_row_edits_ignore_notes_field_below_player_row() -> None:

@@ -245,7 +245,7 @@ class ClubCaddieAutomation:
             for edit in self._descendants(tee_window, control_type="Edit")
             if self._is_visible(edit)
         ]
-        if any(self._text_of(edit) == date_text for edit in edits):
+        if any(self._visible_date_matches(edit, target_date) for edit in edits):
             time.sleep(1)
             return
 
@@ -272,7 +272,7 @@ class ClubCaddieAutomation:
             self._navigate_date_with_arrows(tee_window, target_edit, target_date)
 
     def _looks_like_date_field(self, text: str) -> bool:
-        return bool(re.search(r"\d{1,2}/\d{1,2}/\d{4}", text))
+        return self._parse_date_text(text) is not None
 
     def _select_date_with_calendar(
         self,
@@ -386,10 +386,55 @@ class ClubCaddieAutomation:
 
     def _parse_visible_date(self, date_edit: object) -> date:
         text = self._text_of(date_edit)
-        try:
-            return datetime.strptime(text, "%m/%d/%Y").date()
-        except ValueError as exc:
-            raise ClubCaddieAutomationError(f"Unable to parse visible Tee Sheet date: {text}") from exc
+        parsed_date = self._parse_date_text(text)
+        if parsed_date is None:
+            raise ClubCaddieAutomationError(f"Unable to parse visible Tee Sheet date: {text}")
+        return parsed_date
+
+    def _parse_date_text(self, text: str) -> date | None:
+        normalized = " ".join(text.strip().replace(",", " ").split())
+        if not normalized:
+            return None
+
+        for date_format in (
+            "%m/%d/%Y",
+            "%-m/%-d/%Y",
+            "%d/%m/%Y",
+            "%-d/%-m/%Y",
+            "%m-%d-%Y",
+            "%d-%m-%Y",
+            "%d-%b-%Y",
+            "%d-%B-%Y",
+            "%b %d %Y",
+            "%B %d %Y",
+            "%A %b %d %Y",
+            "%A %B %d %Y",
+        ):
+            try:
+                return datetime.strptime(normalized, date_format).date()
+            except ValueError:
+                continue
+
+        match = re.search(
+            r"\b(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s+(?P<year>\d{4})\b",
+            normalized,
+        )
+        if match:
+            try:
+                return datetime.strptime(
+                    f"{match.group('month')} {match.group('day')} {match.group('year')}",
+                    "%B %d %Y",
+                ).date()
+            except ValueError:
+                try:
+                    return datetime.strptime(
+                        f"{match.group('month')} {match.group('day')} {match.group('year')}",
+                        "%b %d %Y",
+                    ).date()
+                except ValueError:
+                    return None
+
+        return None
 
     def _date_arrow_buttons(self, tee_window: object, date_edit: object) -> tuple[object, object]:
         date_rect = self._safe_rectangle(date_edit)
@@ -429,12 +474,15 @@ class ClubCaddieAutomation:
         deadline = time.monotonic() + (timeout_seconds or self.settings.window_wait_seconds)
         while time.monotonic() < deadline:
             for edit in self._descendants(tee_window, control_type="Edit"):
-                if self._is_visible(edit) and self._text_of(edit) == expected:
+                if self._is_visible(edit) and self._visible_date_matches(edit, target_date):
                     time.sleep(1)
                     return
             time.sleep(0.25)
 
         raise ClubCaddieAutomationError(f"Timed out waiting for Tee Sheet date {expected}.")
+
+    def _visible_date_matches(self, edit: object, target_date: date) -> bool:
+        return self._parse_date_text(self._text_of(edit)) == target_date
 
     def _extract_tee_sheet(self, target_date: date) -> TeeSheetResponse:
         tee_window = self._current_tee_sheet_window()
